@@ -1581,3 +1581,21 @@ Traceback (most recent call last):
   File "/Users/fbustos/Documents/cmms_efd/backend/pm_handler.py", line 271, in maintenance_loop
     for config in configs:
 TypeError: 'NoneType' object is not iterable
+2025-11-27 16:15:01 [INFO] CMMS_LOGGER: 2025-11-27 16:15:01 BULK: starting fetch for lsst.sal.HVAC.glycolSensor.supplyTempChiller02[None]
+2025-11-27 16:15:02 [INFO] CMMS_LOGGER: 2025-11-27 16:15:02 BULK EFD Query: SELECT "supplyTempChiller02" FROM "lsst.sal.HVAC.glycolSensor"
+2025-11-27 16:15:07 [INFO] CMMS_LOGGER: 2025-11-27 16:15:07 BULK: EFD returned no data.
+2025-11-27 16:21:18 [INFO] CMMS_LOGGER: 2025-11-27 16:21:18 BULK: STARTING FULL FETCH
+2025-11-27 16:21:19 [INFO] CMMS_LOGGER: 2025-11-27 16:21:19 Fetch query: SELECT "supplyTempChiller02" FROM "lsst.sal.HVAC.glycolSensor"
+2025-11-27 16:21:19 [INFO] CMMS_LOGGER: 2025-11-27 16:21:19 Executing EFD query...
+2025-11-27 16:21:25 [INFO] CMMS_LOGGER: 2025-11-27 16:21:25 Raw DF type: <class 'pandas.core.frame.DataFrame'>
+2025-11-27 16:21:25 [INFO] CMMS_LOGGER: 2025-11-27 16:21:25 Raw DF columns: []
+2025-11-27 16:21:25 [INFO] CMMS_LOGGER: 2025-11-27 16:21:25 Raw DF size: 0 rows
+2025-11-27 16:21:25 [INFO] CMMS_LOGGER: 2025-11-27 16:21:25 BULK: EFD returned no data.
+2025-11-27 16:23:33 [INFO] CMMS_LOGGER: 2025-11-27 16:23:33 DEBUG: EFD_URL=None
+2025-11-27 16:23:33 [INFO] CMMS_LOGGER: 2025-11-27 16:23:33 DEBUG: USER=None
+2025-11-27 16:23:33 [ERROR] CMMS_LOGGER: 2025-11-27 16:23:33 ERROR: Failed to initialize EfdQueryClient: EfdQueryClient.__init__() got an unexpected keyword argument 'base_url'
+Traceback (most recent call last):
+  File "/Users/fbustos/Documents/cmms_efd_jupyter_comp/adgd8686.py", line 31, in <module>
+    client = EfdQueryClient(
+             ^^^^^^^^^^^^^^^
+TypeError: EfdQueryClient.__init__() got an unexpected keyword argument 'base_url'

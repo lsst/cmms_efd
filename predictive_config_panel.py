@@ -2,34 +2,39 @@ from __future__ import annotations
 
 import os
 import sys
-from typing import Any
+from typing import Any, Optional
 
 import pandas as pd
 import panel as pn
 from dotenv import load_dotenv
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+
 from backend.logger_setup import logger, LOG_TIME_FORMAT
 from influx_query import EfdQueryClient
-
 from linear_trend import run_linear_trend
-from flow_stability import run_flow_stability
+from flow_stability import run_flow_sability
 from ML_trainer import train_linear_regression
+from config_loader import insert_efd_history_point
+from incremental_fetcher import IncrementalEfdFetcher
 
 load_dotenv()
 
 
 def create_predictive_panel() -> pn.Column:
     """
-    Build the predictive analysis configuration interface.
+    Create the predictive analysis interface for CDIAT.
 
-    This interface allows the user to select an EFD measurement, a field,
-    a time window, and execute one of the available predictive models.
-
-    Returns
-    -------
-    pn.Column
-        Panel layout containing predictive configuration widgets.
+    Workflow
+    --------
+    1. User selects measurement, field and optional SAL index.
+    2. User clicks "Fetch EFD History":
+         - Data is fetched INCREMENTALLY in 10-day windows.
+         - Each batch is saved into SQLite (efd_history).
+         - The *last batch* is stored in memory for classical analysis.
+    3. User clicks "Run Analysis":
+         - Trend/Stability → use last in-memory batch.
+         - ML → load full history from SQLite.
     """
 
     client = EfdQueryClient()
@@ -38,13 +43,7 @@ def create_predictive_panel() -> pn.Column:
 
     measurement = pn.widgets.Select(name="Measurement", options=[])
     field = pn.widgets.Select(name="Field", options=[])
-
-    time_value = pn.widgets.IntInput(name="Time Value", value=24, start=1)
-    time_unit = pn.widgets.Select(
-        name="Time Unit",
-        options=["h", "d", "w"],
-        value="h",
-    )
+    sal_input = pn.widgets.TextInput(name="SAL Index (optional)")
 
     analysis_model = pn.widgets.Select(
         name="Analysis Model",
@@ -56,73 +55,155 @@ def create_predictive_panel() -> pn.Column:
         value="LinearTrend",
     )
 
+    data_holder: dict[str, Optional[pd.DataFrame]] = {"df": None}
+
     def load_measurements(event: Any | None = None) -> None:
         try:
             measurements = client.get_measurements()
             measurement.options = measurements
+
             if measurements:
                 measurement.value = measurements[0]
-            logger.info(f"{LOG_TIME_FORMAT()} Measurements loaded")
+
+            logger.info(f"{LOG_TIME_FORMAT()} Measurements loaded.")
         except Exception as exc:
-            logger.error(f"{LOG_TIME_FORMAT()} Measurement load failed: {exc}", exc_info=True)
+            logger.error(
+                f"{LOG_TIME_FORMAT()} Measurement load failed: {exc}",
+                exc_info=True,
+            )
 
     def load_fields(event: Any | None = None) -> None:
         if not measurement.value:
             return
+
         try:
             fields = client.get_fields(measurement.value) or []
             field.options = fields
+
             if fields:
                 field.value = fields[0]
-            logger.info(f"{LOG_TIME_FORMAT()} Fields loaded for {measurement.value}")
+
+            logger.info(
+                f"{LOG_TIME_FORMAT()} Fields loaded for {measurement.value}."
+            )
         except Exception as exc:
-            logger.error(f"{LOG_TIME_FORMAT()} Field load failed: {exc}", exc_info=True)
+            logger.error(
+                f"{LOG_TIME_FORMAT()} Field load failed: {exc}",
+                exc_info=True,
+            )
 
     measurement.param.watch(load_fields, "value")
 
-    def build_time_window() -> str:
-        value = max(1, time_value.value)
-        unit = time_unit.value
-        return f"{value}{unit}"
-
-    def run_analysis(event: Any | None = None) -> None:
+    def fetch_history(event: Any | None = None) -> None:
+        """
+        Fetch EFD history incrementally (10-day windows) and store it
+        inside `efd_history`. The last window is stored in memory.
+        """
         if not measurement.value or not field.value:
-            logger.info(f"{LOG_TIME_FORMAT()} Missing measurement or field")
+            logger.info(f"{LOG_TIME_FORMAT()} Missing measurement or field.")
             return
 
-        interval = build_time_window()
+        raw_sal = sal_input.value.strip()
+        sal_index: Optional[int] = int(raw_sal) if raw_sal.isdigit() else None
 
         try:
-            influx_query = (
-                f'SELECT "{field.value}" FROM "{measurement.value}" '
-                f'WHERE time > now() - {interval}'
+            logger.info(
+                f"{LOG_TIME_FORMAT()} Starting incremental fetch | "
+                f"measurement={measurement.value}, field={field.value}, "
+                f"salIndex={sal_index}"
             )
 
-            df = client.query(influx_query)
+            batches = fetch_incremental_history(
+                client=client,
+                measurement=measurement.value,
+                field=field.value,
+                sal_index=sal_index,
+                window_days=10,
+            )
 
-            if df.empty:
-                logger.info(f"{LOG_TIME_FORMAT()} Query returned no data")
+            if not batches:
+                logger.info(
+                    f"{LOG_TIME_FORMAT()} No data fetched from EFD."
+                )
                 return
 
-            if "time" in df.columns and "timestamp" not in df.columns:
-                df = df.rename(columns={"time": "timestamp"})
+            last_df = batches[-1]
 
-            model_name = analysis_model.value
+            for df in batches:
+                for _, row in df.iterrows():
+                    ts_str = row["timestamp"].isoformat()
+                    val = float(row[field.value])
+                    insert_efd_history_point(
+                        timestamp_utc=ts_str,
+                        measurement=measurement.value,
+                        field=field.value,
+                        value=val,
+                        salIndex=sal_index,
+                    )
 
-            if model_name == "LinearTrend":
-                run_linear_trend(df, field.value)
+            data_holder["df"] = last_df
 
-            elif model_name == "FlowStability":
-                run_flow_stability(df, field.value)
-
-            elif model_name == "LinearRegressionML":
-                train_linear_regression(df, field.value)
-
-            else:
-                logger.info(f"{LOG_TIME_FORMAT()} Unknown model: {model_name}")
+            logger.info(
+                f"{LOG_TIME_FORMAT()} Incremental fetch completed | "
+                f"windows={len(batches)}, last_rows={len(last_df)}"
+            )
 
         except Exception as exc:
-            logger.error(f"{LOG_TIME_FORMAT()} Analysis execution failed: {exc}", exc_info=True)
+            logger.error(
+                f"{LOG_TIME_FORMAT()} Incremental fetch failed: {exc}",
+                exc_info=True,
+            )
+            data_holder["df"] = None
+
+    def run_analysis(event: Any | None = None) -> None:
+        """
+        Run analysis depending on the model selection.
+        Trend/Stability → use last in-memory DF.
+        ML → use SQLite stored history.
+        """
+        model_name = analysis_model.value
+
+        try:
+            if model_name in ("LinearTrend", "FlowStability"):
+                df = data_holder.get("df")
+
+                if df is None or df.empty:
+                    logger.info(
+                        f"{LOG_TIME_FORMAT()} No data in memory. "
+                        f"Run 'Fetch EFD History' first."
+                    )
+                    return
+
+                if model_name == "LinearTrend":
+                    run_linear_trend(df, field.value)
+
+                elif model_name == "FlowStability":
+                    run_flow_stability(df, field.value)
+
+            elif model_name == "LinearRegressionML":
+                raw_sal = sal_input.value.strip()
+                sal_index: Optional[int] = (
+                    int(raw_sal) if raw_sal.isdigit() else None
+                )
+
+                result = train_linear_regression(
+                    measurement=measurement.value,
+                    field=field.value,
+                    sal_index=sal_index,
+                )
+
+                logger.info(f"{LOG_TIME_FORMAT()} ML result: {result}")
+
+            else:
+                logger.info(
+                    f"{LOG_TIME_FORMAT()} Unknown analysis model."
+                )
+
+        except Exception as exc:
+            logger.error(
+                f"{LOG_TIME_FORMAT()} Analysis execution failed: {exc}",
+                exc_info=True,
+            )
 
     load_button = pn.widgets.Button(
         name="Load Measurements",
@@ -130,6 +211,13 @@ def create_predictive_panel() -> pn.Column:
         width=160,
     )
     load_button.on_click(load_measurements)
+
+    fetch_button = pn.widgets.Button(
+        name="Fetch EFD History (Incremental)",
+        button_type="primary",
+        width=250,
+    )
+    fetch_button.on_click(fetch_history)
 
     run_button = pn.widgets.Button(
         name="Run Analysis",
@@ -141,8 +229,9 @@ def create_predictive_panel() -> pn.Column:
     layout = pn.Column(
         title,
         pn.Row(measurement, field),
-        pn.Row(time_value, time_unit, analysis_model),
-        pn.Row(load_button, run_button),
+        pn.Row(sal_input),
+        pn.Row(analysis_model),
+        pn.Row(load_button, fetch_button, run_button),
         sizing_mode="stretch_width",
     )
 

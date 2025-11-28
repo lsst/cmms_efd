@@ -21,12 +21,14 @@
 
 from __future__ import annotations
 
-import sqlite3
-from datetime import datetime, timedelta
-import pytz
 import logging
 import os
-from typing import Any, Iterable, Optional
+import sqlite3
+from datetime import datetime, timedelta
+from typing import Any, Iterable, Optional, Dict, List
+
+import pytz
+import json
 
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__)))
 DB_PATH = os.path.join(BASE_DIR, "intDB.db")
@@ -40,9 +42,23 @@ if not logger.hasHandlers():
     handler.setFormatter(logging.Formatter("[%(levelname)s] %(message)s"))
     logger.addHandler(handler)
 
-def _execute_query(query: str, params: Iterable[Any] | None = None,
-                   db_path: str = DB_PATH) -> None:
-    """Execute a write query (INSERT, UPDATE, DELETE)."""
+def _execute_query(
+    query: str,
+    params: Iterable[Any] | None = None,
+    db_path: str = DB_PATH,
+) -> None:
+    """
+    Execute a write query (INSERT, UPDATE, DELETE).
+
+    Parameters
+    ----------
+    query : str
+        SQL statement to be executed.
+    params : Iterable[Any] or None
+        Positional parameters for the query.
+    db_path : str
+        Path to the SQLite database file.
+    """
     params = params or ()
     try:
         with sqlite3.connect(db_path) as conn:
@@ -52,14 +68,33 @@ def _execute_query(query: str, params: Iterable[Any] | None = None,
         logger.error(f"DB write failed: {exc}")
 
 
-def _execute_fetch(query: str, params: Iterable[Any] | None = None,
-                   db_path: str = DB_PATH) -> list[tuple]:
-    """Execute a SELECT query and return all rows."""
+def _execute_fetch(
+    query: str,
+    params: Iterable[Any] | None = None,
+    db_path: str = DB_PATH,
+) -> list[tuple]:
+    """
+    Execute a SELECT query and return all rows.
+
+    Parameters
+    ----------
+    query : str
+        SQL SELECT statement.
+    params : Iterable[Any] or None
+        Positional parameters for the query.
+    db_path : str
+        Path to the SQLite database file.
+
+    Returns
+    -------
+    list of tuple
+        Result rows returned by the query.
+    """
     params = params or ()
     try:
         with sqlite3.connect(db_path) as conn:
-            cur = conn.execute(query, params)
-            return cur.fetchall()
+            cursor = conn.execute(query, params)
+            return cursor.fetchall()
     except Exception as exc:
         logger.error(f"DB fetch failed: {exc}")
         return []
@@ -71,7 +106,6 @@ def read_config_from_db(db_path: str = DB_PATH) -> list[dict]:
     Returns
     -------
     list of dict
-        Each dictionary contains the configuration fields.
     """
     rows = _execute_fetch(
         """
@@ -84,24 +118,24 @@ def read_config_from_db(db_path: str = DB_PATH) -> list[dict]:
 
     return [
         {
-            "id": r[0],
-            "name": r[1],
-            "measurement": r[2],
-            "field": r[3],
-            "asset_id": r[4],
-            "attribute": r[5],
-            "db_name": r[6],
-            "time_interval": r[7],
-            "salIndex": r[8],
-            "type_telemetry": r[9],
+            "id": row[0],
+            "name": row[1],
+            "measurement": row[2],
+            "field": row[3],
+            "asset_id": row[4],
+            "attribute": row[5],
+            "db_name": row[6],
+            "time_interval": row[7],
+            "salIndex": row[8],
+            "type_telemetry": row[9],
         }
-        for r in rows
+        for row in rows
     ]
 
 
 def insert_config(entry: dict, db_path: str = DB_PATH) -> None:
     """
-    Insert a new configuration entry into `config_interval`.
+    Insert a new configuration entry.
     """
     _execute_query(
         """
@@ -158,10 +192,10 @@ def update_config(entry: dict, db_path: str = DB_PATH) -> None:
 
 def has_24h_passed_since_last_run(db_path: str = DB_PATH) -> bool:
     """
-    Determine whether 24 hours have elapsed since the last run.
+    Check whether 24 hours have elapsed since the last shutter run.
     """
     rows = _execute_fetch(
-        """SELECT last_run FROM shutter_schedule WHERE id = 1""",
+        "SELECT last_run FROM shutter_schedule WHERE id = 1",
         db_path=db_path,
     )
 
@@ -177,8 +211,11 @@ def has_24h_passed_since_last_run(db_path: str = DB_PATH) -> bool:
         return True
 
 
-def save_shutter_activation_to_db(db_path: str, asset_id: str,
-                                  num_activations: int) -> None:
+def save_shutter_activation_to_db(
+    db_path: str,
+    asset_id: str,
+    num_activations: int,
+) -> None:
     """
     Record shutter activation count.
     """
@@ -195,7 +232,7 @@ def save_shutter_activation_to_db(db_path: str, asset_id: str,
 
 def update_last_run_timestamp(db_path: str = DB_PATH) -> None:
     """
-    Update shutter last-run timestamp.
+    Update the last shutter run timestamp.
     """
     now = datetime.now(CHILE_TZ).strftime("%Y-%m-%dT%H:%M:%S")
     _execute_query(
@@ -203,7 +240,7 @@ def update_last_run_timestamp(db_path: str = DB_PATH) -> None:
         INSERT INTO shutter_schedule (id, last_run)
         VALUES (1, ?)
         ON CONFLICT(id)
-        DO UPDATE SET last_run=excluded.last_run
+        DO UPDATE SET last_run = excluded.last_run
         """,
         (now,),
         db_path=db_path,
@@ -228,39 +265,16 @@ def get_last_run_timestamp(db_path: str = DB_PATH) -> Optional[datetime]:
 
     return None
 
-def save_efd_history(timestamp: str, measurement: str, field: str,
-                     value: float, asset_id: str,
-                     db_path: str = DB_PATH) -> None:
+def save_trigger_event(
+    config_id: str,
+    frequency: int,
+    frequency_um: str,
+    db_path: str = DB_PATH,
+) -> None:
     """
-    Save EFD data into history (skips duplicates).
+    Save or update a trigger event.
     """
-    exists = _execute_fetch(
-        """
-        SELECT 1 FROM efd_history
-        WHERE timestamp = ? AND measurement = ? AND field = ? AND value = ?
-        """,
-        (timestamp, measurement, field, value),
-        db_path=db_path,
-    )
-
-    if exists:
-        return
-
-    _execute_query(
-        """
-        INSERT INTO efd_history (timestamp, measurement, field, value, asset_id)
-        VALUES (?, ?, ?, ?, ?)
-        """,
-        (timestamp, measurement, field, value, asset_id),
-        db_path=db_path,
-    )
-
-def save_trigger_event(config_id: str, frequency: int, frequency_um: str,
-                       db_path: str = DB_PATH) -> None:
-    """
-    Save or update trigger events in `trigger_log`.
-    """
-    ts = datetime.now().isoformat()
+    ts = datetime.now(CHILE_TZ).isoformat()
     _execute_query(
         """
         INSERT INTO trigger_log (config_id, last_trigger_time, frequency, frequencyUM)
@@ -276,10 +290,12 @@ def save_trigger_event(config_id: str, frequency: int, frequency_um: str,
     )
 
 
-def get_last_trigger_info(config_id: str, db_path: str = DB_PATH
-                          ) -> tuple[Optional[datetime], Optional[int], Optional[str]]:
+def get_last_trigger_info(
+    config_id: str,
+    db_path: str = DB_PATH,
+) -> tuple[Optional[datetime], Optional[int], Optional[str]]:
     """
-    Retrieve trigger log metadata.
+    Retrieve trigger log info.
     """
     rows = _execute_fetch(
         """
@@ -294,72 +310,210 @@ def get_last_trigger_info(config_id: str, db_path: str = DB_PATH
     if not rows:
         return None, None, None
 
-    ts, freq, freq_um = rows[0]
+    ts_raw, freq, freq_um = rows[0]
 
     try:
-        ts = datetime.fromisoformat(ts)
+        last_ts = datetime.fromisoformat(ts_raw)
     except Exception:
-        ts = None
+        last_ts = None
 
-    return ts, freq, freq_um
+    return last_ts, freq, freq_um
 
-def init_ml_storage(db_path: str = DB_PATH) -> None:
-    """
-    Create ML model table if it does not exist.
-    """
-    _execute_query(
-        """
-        CREATE TABLE IF NOT EXISTS ml_models (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            measurement TEXT NOT NULL,
-            field TEXT NOT NULL,
-            slope REAL NOT NULL,
-            intercept REAL NOT NULL,
-            trained_at TEXT NOT NULL
-        )
-        """,
-        db_path=db_path,
-    )
-
-
-def save_ml_linear_model(measurement: str, field: str,
-                         slope: float, intercept: float,
-                         db_path: str = DB_PATH) -> None:
-    """
-    Persist a trained linear regression model.
-    """
-    ts = datetime.now(CHILE_TZ).isoformat()
-    _execute_query(
-        """
-        INSERT INTO ml_models (measurement, field, slope, intercept, trained_at)
-        VALUES (?, ?, ?, ?, ?)
-        """,
-        (measurement, field, slope, intercept, ts),
-        db_path=db_path,
-    )
-
-
-def load_latest_ml_linear_model(
-    measurement: str, field: str,
+def insert_efd_history_point(
+    timestamp_utc: str,
+    measurement: str,
+    field: str,
+    value: float,
+    salIndex: Optional[int],
     db_path: str = DB_PATH,
-) -> Optional[tuple[float, float]]:
+) -> None:
     """
-    Load the newest model parameters.
+    Insert a telemetry data point into `efd_history`, ensuring no duplicates.
+    """
+    try:
+        _execute_query(
+            """
+            INSERT INTO efd_history (
+                timestamp_utc, measurement, field, value, salIndex
+            )
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (timestamp_utc, measurement, field, value, salIndex),
+            db_path=db_path,
+        )
+        logger.debug(
+            f"Inserted EFD data point: {timestamp_utc} {measurement}.{field}[{salIndex}] = {value}"
+        )
+    except Exception as exc:
+        logger.error(f"EFD history insert failed: {exc}")
+
+
+def fetch_efd_history(
+    measurement: str,
+    field: str,
+    salIndex: Optional[int],
+    db_path: str = DB_PATH,
+) -> List[Dict[str, Any]]:
+    """
+    Fetch ordered telemetry history for a given signal.
     """
     rows = _execute_fetch(
         """
-        SELECT slope, intercept
-        FROM ml_models
-        WHERE measurement = ? AND field = ?
-        ORDER BY id DESC
+        SELECT timestamp_utc, measurement, field, value, salIndex
+        FROM efd_history
+        WHERE measurement = ?
+          AND field = ?
+          AND (salIndex IS ? OR salIndex = ?)
+        ORDER BY timestamp_utc ASC
+        """,
+        (measurement, field, salIndex, salIndex),
+        db_path=db_path,
+    )
+
+    return [
+        {
+            "timestamp_utc": r[0],
+            "measurement": r[1],
+            "field": r[2],
+            "value": float(r[3]),
+            "salIndex": r[4],
+        }
+        for r in rows
+    ]
+
+
+def init_ml_storage(db_path: str = DB_PATH) -> None:
+    """
+    Ensure ML indexes exist.
+    """
+    try:
+        _execute_query(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_ml_linear_models_unique
+            ON ml_linear_models (measurement, field, salIndex, version)
+            """,
+            db_path=db_path,
+        )
+        logger.debug("ML storage (linear regression) initialized.")
+    except Exception as exc:
+        logger.error(f"Failed to initialize ML storage: {exc}")
+
+
+def save_ml_linear_model(
+    measurement: str,
+    field: str,
+    salIndex: Optional[int],
+    slope: float,
+    intercept: float,
+    rmse: float,
+    r2: float,
+    train_size: int,
+    params: Dict[str, Any],
+    db_path: str = DB_PATH,
+) -> int:
+    """
+    Save a linear regression model into the ml_linear_models table.
+    """
+    trained_at = datetime.now(CHILE_TZ).isoformat()
+
+    rows = _execute_fetch(
+        """
+        SELECT MAX(version)
+        FROM ml_linear_models
+        WHERE measurement = ?
+          AND field = ?
+          AND (salIndex IS ? OR salIndex = ?)
+        """,
+        (measurement, field, salIndex, salIndex),
+        db_path=db_path,
+    )
+
+    next_version = (rows[0][0] or 0) + 1
+
+    _execute_query(
+        """
+        UPDATE ml_linear_models
+        SET is_active = 0
+        WHERE measurement = ?
+          AND field = ?
+          AND (salIndex IS ? OR salIndex = ?)
+          AND is_active = 1
+        """,
+        (measurement, field, salIndex, salIndex),
+        db_path=db_path,
+    )
+
+    _execute_query(
+        """
+        INSERT INTO ml_linear_models (
+            measurement, field, salIndex, version,
+            slope, intercept, rmse, r2, train_size,
+            params_json, is_active, trained_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
+        """,
+        (
+            measurement,
+            field,
+            salIndex,
+            next_version,
+            slope,
+            intercept,
+            rmse,
+            r2,
+            train_size,
+            json.dumps(params, ensure_ascii=False),
+            trained_at,
+        ),
+        db_path=db_path,
+    )
+
+    logger.debug(
+        f"Saved Linear Regression model v{next_version} for "
+        f"{measurement}.{field}[{salIndex}] (r2={r2}, rmse={rmse})"
+    )
+
+    return next_version
+
+
+def load_latest_ml_linear_model(
+    measurement: str,
+    field: str,
+    salIndex: Optional[int],
+    db_path: str = DB_PATH,
+) -> Optional[Dict[str, Any]]:
+    """
+    Load the latest active linear regression model.
+    """
+    rows = _execute_fetch(
+        """
+        SELECT id, version, slope, intercept, rmse, r2, train_size,
+               params_json, trained_at
+        FROM ml_linear_models
+        WHERE measurement = ?
+          AND field = ?
+          AND (salIndex IS ? OR salIndex = ?)
+          AND is_active = 1
+        ORDER BY version DESC
         LIMIT 1
         """,
-        (measurement, field),
+        (measurement, field, salIndex, salIndex),
         db_path=db_path,
     )
 
     if not rows:
         return None
 
-    slope, intercept = rows[0]
-    return float(slope), float(intercept)
+    row = rows[0]
+
+    return {
+        "id": row[0],
+        "version": row[1],
+        "slope": row[2],
+        "intercept": row[3],
+        "rmse": row[4],
+        "r2": row[5],
+        "train_size": row[6],
+        "params": json.loads(row[7]),
+        "trained_at": row[8],
+    }
